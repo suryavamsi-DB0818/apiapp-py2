@@ -45,6 +45,13 @@ app = FastAPI(title="UID2 Token Generation API")
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+@app.middleware("http")
+async def prevent_response_caching(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def require_api_bearer(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> None:

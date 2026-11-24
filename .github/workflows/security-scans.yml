@@ -75,15 +75,17 @@ jobs:
 
       - name: Run OWASP ZAP baseline scan
         run: |
+          mkdir -p zap-output
+          chmod 777 zap-output
           docker run --rm --network host \
-            --volume "$PWD:/zap/wrk/:rw" \
+            --volume "$PWD/zap-output:/zap/wrk/:rw" \
             ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af \
-            zap-baseline.py -t http://127.0.0.1:8000 -m 2 -r zap-report.html
+            zap-baseline.py -t http://127.0.0.1:8000/docs -m 2 -r zap-report.html
 
       - name: Upload ZAP report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zap-baseline-report
-          path: zap-report.html
+          path: zap-output/zap-report.html
           if-no-files-found: warn
