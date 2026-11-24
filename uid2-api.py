@@ -214,6 +214,15 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/")
+def root() -> dict:
+    return {
+        "service": "UID2 Token Generation API",
+        "health": "/health",
+        "openapi": "/openapi.json",
+    }
+
+
 @app.post(
     "/uid2/token",
     response_model=TokenResponse,

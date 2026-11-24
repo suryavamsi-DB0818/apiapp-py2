@@ -27,7 +27,9 @@ an HTTP bearer authorization header when testing `POST /uid2/token`.
 `.github/workflows/security-scans.yml` runs Semgrep SAST and an OWASP ZAP
 baseline DAST scan on pushes, pull requests, weekly, and on manual dispatch.
 Both scanner images and GitHub Actions are pinned to immutable digests or
-commits. Scan reports are uploaded as workflow artifacts.
+commits. Semgrep SARIF and the ZAP HTML report are uploaded as workflow
+artifacts. ZAP warnings are retained in the report but do not fail the job by
+themselves; confirmed ZAP failures still fail it.
 
 The ZAP baseline scan is passive and unauthenticated; it is not a full
 penetration test. The DAST job starts the API with placeholder credentials and
