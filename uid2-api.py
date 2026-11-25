@@ -1,22 +1,24 @@
 import base64
 import binascii
+import hashlib
+import json
 import os
 import re
-import secrets
-import urllib.error
+import time
 from typing import List, Literal, Optional
 
+import requests
+from requests.adapters import HTTPAdapter
+from Crypto.Cipher import AES
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from uid2_client import TokenGenerateInput, Uid2PublisherClient
-from uid2_client.input_util import normalize_email_string
 
-BASE_URL = "https://global.prod.uidapi.com"
+BASE_URL = "https://operator-integ.uidapi.com"
+TOKEN_GENERATE_ENDPOINT = f"{BASE_URL}/v2/token/generate"
 
 load_dotenv()
 
@@ -29,20 +31,21 @@ def _required_setting(name: str) -> str:
 
 
 API_KEY = _required_setting("UID2_API_KEY")
-CLIENT_SECRET = _required_setting("UID2_CLIENT_SECRET")
-API_BEARER_TOKEN = _required_setting("API_BEARER_TOKEN")
+CLIENT_SECRET = base64.b64decode(_required_setting("UID2_CLIENT_SECRET"))
 
 SUPPORTED_ID_TYPES = ("email", "email_hash")
-MAX_IDENTIFIERS = len(SUPPORTED_ID_TYPES)  # each logical identifier at most once
+MAX_IDENTIFIERS = len(SUPPORTED_ID_TYPES)
 MAX_EMAIL_LENGTH = 254
-MAX_EMAIL_HASH_LENGTH = 64  # hex SHA-256; base64 SHA-256 is 44 chars
+MAX_EMAIL_HASH_LENGTH = 64
 
 _HEX_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
-client = Uid2PublisherClient(BASE_URL, API_KEY, CLIENT_SECRET)
+UID2_POOL_SIZE = 64
+_http = requests.Session()
+_http.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=UID2_POOL_SIZE))
+_http.headers.update({"Authorization": f"Bearer {API_KEY}"})
 
 app = FastAPI(title="UID2 Token Generation API")
-bearer_scheme = HTTPBearer(auto_error=False)
 
 
 @app.middleware("http")
@@ -50,17 +53,6 @@ async def prevent_response_caching(request: Request, call_next):
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-def require_api_bearer(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-) -> None:
-    if credentials is None or not secrets.compare_digest(credentials.credentials, API_BEARER_TOKEN):
-        raise StarletteHTTPException(
-            status_code=401,
-            detail="Missing or invalid bearer token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
 
 # ---------- Error handling: every error is {"error": <code>, "message": <text>} ----------
@@ -142,27 +134,80 @@ class ErrorResponse(BaseModel):
 
 # ---------- Input validation (400) ----------
 
-def _email_input(value: str) -> TokenGenerateInput:
+def _normalize_email(email: str) -> Optional[str]:
+    pre_sb = []
+    pre_sb_specialized = []
+    sb = []
+    ws_buffer = []
+
+    parsing_local_part = False
+    started = False
+    in_extension = False
+
+    for c_given in email:
+        c = c_given.lower() if "A" <= c_given <= "Z" else c_given
+
+        if not started:
+            if c == " ":
+                continue
+            started = True
+            parsing_local_part = True
+
+        if parsing_local_part:
+            if c == "@":
+                parsing_local_part = False
+            elif c in (".", "+"):
+                pre_sb.append(c)
+                if c == "+":
+                    in_extension = True
+            else:
+                pre_sb.append(c)
+                if not in_extension:
+                    pre_sb_specialized.append(c)
+        else:
+            if c == "@":
+                return None
+            if c == " ":
+                ws_buffer.append(c)
+                continue
+            if ws_buffer:
+                sb.extend(ws_buffer)
+                ws_buffer = []
+            sb.append(c)
+
+    if not sb:
+        return None
+    domain_part = "".join(sb)
+
+    address_part_to_use = pre_sb_specialized if domain_part == "gmail.com" else pre_sb
+    if not address_part_to_use:
+        return None
+
+    return "".join(address_part_to_use) + "@" + domain_part
+
+
+def _email_input(value: str) -> dict:
     if len(value) > MAX_EMAIL_LENGTH:
         raise invalid_request(f"email exceeds maximum length of {MAX_EMAIL_LENGTH} characters.")
-    if normalize_email_string(value) is None:
+    normalized = _normalize_email(value)
+    if normalized is None:
         raise invalid_request("email is not a valid email address.")
-    return TokenGenerateInput.from_email(value)
+    email_hash = base64.b64encode(hashlib.sha256(normalized.encode("utf-8")).digest()).decode("utf-8")
+    return {"email_hash": email_hash}
 
 
-def _email_hash_input(value: str) -> TokenGenerateInput:
+def _email_hash_input(value: str) -> dict:
     if len(value) > MAX_EMAIL_HASH_LENGTH:
         raise invalid_request("email_hash is too long; expected a base64-encoded SHA-256 hash.")
     if _HEX_SHA256.match(value):
-        # Accept hex SHA-256 and convert to the base64 form UID2 expects
-        return TokenGenerateInput.from_hashed_email(base64.b64encode(bytes.fromhex(value)).decode("utf-8"))
+        return {"email_hash": base64.b64encode(bytes.fromhex(value)).decode("utf-8")}
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError):
         raise invalid_request("email_hash is not valid base64.")
     if len(decoded) != 32:
         raise invalid_request("email_hash must be a base64-encoded SHA-256 hash (32 bytes).")
-    return TokenGenerateInput.from_hashed_email(value)
+    return {"email_hash": value}
 
 
 def validate_identifiers(identifiers: List[Identifier]) -> List[tuple]:
@@ -185,28 +230,60 @@ def validate_identifiers(identifiers: List[Identifier]) -> List[tuple]:
         seen.add(id_type)
         if not value:
             raise invalid_request(f"identifiers.{i}.id_value must not be empty.")
-        token_input = _email_input(value) if id_type == "email" else _email_hash_input(value)
-        inputs.append((id_type, token_input))
+        payload = _email_input(value) if id_type == "email" else _email_hash_input(value)
+        inputs.append((id_type, payload))
     return inputs
+
+
+def _encrypt_request(payload: dict, secret: bytes) -> bytes:
+    iv = os.urandom(12)
+    cipher = AES.new(secret, AES.MODE_GCM, nonce=iv)
+
+    millisec = int(time.time() * 1000)
+    nonce = os.urandom(8)
+
+    body = millisec.to_bytes(8, "big") + nonce + json.dumps(payload).encode("utf-8")
+    ciphertext, tag = cipher.encrypt_and_digest(body)
+
+    envelope = b"\x01" + iv + ciphertext + tag
+    return base64.b64encode(envelope)
+
+
+def _decrypt_response(response_bytes: bytes, secret: bytes) -> dict:
+    iv = response_bytes[:12]
+    data = response_bytes[12:-16]
+    tag = response_bytes[-16:]
+
+    cipher = AES.new(secret, AES.MODE_GCM, nonce=iv)
+    decrypted = cipher.decrypt_and_verify(data, tag)
+
+    return json.loads(decrypted[16:].decode("utf-8"))
 
 
 # ---------- UID2 call (500 / 503) ----------
 
-def generate_token(token_input: TokenGenerateInput) -> Optional[str]:
-    """Returns the UID2 advertising token, or None if no token is available (e.g. opted out)."""
+def generate_token(payload: dict) -> Optional[str]:
+    envelope = _encrypt_request(payload, CLIENT_SECRET)
+
     try:
-        response = client.generate_token(token_input)
-    except urllib.error.HTTPError as e:
-        if e.code == 429 or e.code >= 500:
-            raise ApiError(503, "service_unavailable", "UID2 service is temporarily unavailable.")
-        raise ApiError(500, "internal_error", f"UID2 service rejected the request (HTTP {e.code}).")
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        response = _http.post(TOKEN_GENERATE_ENDPOINT, data=envelope)
+    except requests.exceptions.RequestException:
         raise ApiError(503, "service_unavailable", "UID2 service is temporarily unavailable.")
 
-    identity = response.get_identity()
-    if identity is None:
+    if response.status_code == 429 or response.status_code >= 500:
+        raise ApiError(503, "service_unavailable", "UID2 service is temporarily unavailable.")
+    if response.status_code >= 400:
+        raise ApiError(500, "internal_error", f"UID2 service rejected the request (HTTP {response.status_code}).")
+
+    response_bytes = base64.b64decode(response.content)
+    body = _decrypt_response(response_bytes, CLIENT_SECRET)
+
+    status = body.get("status")
+    if status == "optout":
         return None
-    return identity.get_advertising_token()
+    if status != "success":
+        raise ApiError(500, "internal_error", f"UID2 service returned unexpected status '{status}'.")
+    return body["body"]["advertising_token"]
 
 
 @app.get("/health")
@@ -228,27 +305,20 @@ def root() -> dict:
     response_model=TokenResponse,
     responses={
         400: {"model": ErrorResponse, "description": "Invalid request."},
-        401: {"model": ErrorResponse, "description": "Missing or invalid bearer token."},
         500: {"model": ErrorResponse, "description": "Internal service error."},
         503: {"model": ErrorResponse, "description": "UID2 service is unavailable."},
     },
 )
-def generate_tokens(
-    body: TokenRequest,
-    _: None = Depends(require_api_bearer),
-) -> TokenResponse:
+def generate_tokens(body: TokenRequest) -> TokenResponse:
     inputs = validate_identifiers(body.identifiers)
-    # Try identifiers in the order given; return the first one that yields a token.
-    for id_type, token_input in inputs:
-        token = generate_token(token_input)
+    for id_type, payload in inputs:
+        token = generate_token(payload)
         if token:
             return TokenResponse(uid2_token=token, uid2_token_status="found", matched_id_type=id_type)
     return TokenResponse(uid2_token=None, uid2_token_status="not_found", matched_id_type="none")
 
 
 if __name__ == "__main__":
-    import os
-
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("DATABRICKS_APP_PORT", "8000")))

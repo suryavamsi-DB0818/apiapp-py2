@@ -19,8 +19,7 @@ settings. `.env` is ignored by Git; do not commit real credentials.
 The example values are placeholders for local startup and health checks only.
 They are not valid UID2 credentials, so token generation will not work until
 you provide valid non-production `UID2_API_KEY` and `UID2_CLIENT_SECRET`
-credentials. The local bearer token is `local-development-token`; send it as
-an HTTP bearer authorization header when testing `POST /uid2/token`.
+credentials.
 
 ## GitHub security scans
 
@@ -32,6 +31,5 @@ artifacts. ZAP warnings are retained in the report but do not fail the job by
 themselves; confirmed ZAP failures still fail it.
 
 The ZAP baseline scan is passive and unauthenticated; it is not a full
-penetration test. The DAST job starts the API with placeholder credentials and
-verifies that `/uid2/token` rejects unauthenticated requests. It does not call
-the real UID2 service.
+penetration test. The DAST job starts the API with placeholder credentials. It
+does not call the real UID2 service.

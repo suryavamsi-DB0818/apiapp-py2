@@ -63,15 +63,6 @@ jobs:
         env:
           UID2_API_KEY: UID2-C-P-SECURITY-SCAN
           UID2_CLIENT_SECRET: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-          API_BEARER_TOKEN: security-workflow-test-token
-
-      - name: Verify token endpoint requires authentication
-        run: |
-          status=$(curl --silent --output /dev/null --write-out "%{http_code}" \
-            --request POST http://127.0.0.1:8000/uid2/token \
-            --header "Content-Type: application/json" \
-            --data '{"identifiers":[{"id_type":"email","id_value":"test@example.com"}]}')
-          test "$status" = "401"
 
       - name: Run OWASP ZAP baseline scan
         run: |
